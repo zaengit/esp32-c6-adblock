@@ -2,13 +2,11 @@
 
 A **Pi-hole-style DNS ad-blocker** for ESP32-C6-WROOM boards — *no PSRAM required*.
 
-> **Origin:** This is an ESP32-C6 adaptation of [M-Abozaid/esp32-c3-adblock](https://github.com/M-Abozaid/esp32-c3-adblock). See [Credits](#credits) for project provenance and attribution.
->
-> 📰 The original ESP32-C3 project was featured on [Tom's Hardware](https://www.tomshardware.com/networking/clever-hacker-fits-537-000-domains-in-a-tiny-usd5-esp32-ad-blocking-dongle-firmware-uses-only-around-50kb-of-ram-and-can-answer-blocked-lookups-in-10-milliseconds), [XDA Developers](https://www.xda-developers.com/this-tiny-esp32-powered-gadget-blocks-537000-domains-only-uses-50kb-of-ram/), and [Korben](https://korben.info/en/half-million-ad-blocking-domains-50kb-ram-esp32.html).
+> **Origin:** This project adapts M-Abozaid's DNS ad-blocking project for ESP32-C6. See [Credits](#credits) for attribution.
 
 The trick everyone misses: you don't need to keep the blocklist in RAM. Store the
 domains as **sorted 40-bit hashes in flash** and binary-search them. 140,000+ domains
-fit in ~0.7 MB of flash. The C6 build uses a flash index sized for up to about
+fit in ~0.7 MB of flash. The ESP32-C6 build uses a flash index sized for up to about
 2.08 million domain hashes; RAM use stays independent of blocklist size.
 
 ```
@@ -24,16 +22,16 @@ still run before cache lookups.
 
 ## Why this is interesting
 
-Most ESP32 DNS sinkholes load the blocklist (domain *strings*) into RAM, so they
-demand PSRAM. This project stores fixed **5-byte (40-bit) hashes in flash** instead:
+The ESP32-C6 can store fixed **5-byte (40-bit) hashes in flash**, so the blocklist
+does not need to be loaded into RAM:
 
-| | string-in-RAM approach | this (hash-in-flash) |
+| Metric | ESP32-C6 |
 |---|---|---|
-| Hardware | ESP32 + PSRAM | ESP32-C6-WROOM, no PSRAM |
-| 141k domains | ~2.5 MB of RAM | **0.67 MB of flash** |
-| RAM used | most of it | fixed buffers, independent of blocklist size |
-| Lookup | string compare | ~18 flash reads (~10 ms incl. WiFi RTT) |
-| Collisions | n/a | 0 at 141k (1 at 537k) |
+| Hardware | ESP32-C6-WROOM, no PSRAM |
+| 141k domains | **0.67 MB of flash** |
+| RAM used | fixed buffers, independent of blocklist size |
+| Lookup | ~18 flash reads (~10 ms incl. WiFi RTT) |
+| Collisions | 0 at 141k (1 at 537k) |
 
 **Why 40 bits?** It's the sweet spot for this flash budget. Collisions follow the
 birthday bound — at 141k domains you get ~0, at 537k about 1 (i.e. one unlucky
@@ -41,9 +39,8 @@ domain gets over-blocked). Dropping to 32 bits would save 20% of the flash but
 cost ~7 collisions at 250k; going to 64 bits wastes 3 bytes per domain to solve
 a problem you don't have.
 
-The same approach works on larger ESP32 chips too. On this C6 build, the 16 MB
-module uses an 8,192-entry flash index that can address up to **~2.08M domains**
-without loading the full blocklist into RAM.
+The 16 MB ESP32-C6 module uses an 8,192-entry flash index that can address up to
+**~2.08M domains** without loading the full blocklist into RAM.
 
 ## Hardware
 
@@ -59,7 +56,7 @@ without loading the full blocklist into RAM.
 One USB flash to get going — after that, **firmware and blocklist both update over WiFi** (see below).
 
 > Use a current PlatformIO release. The C6 target uses the pioarduino platform for
-> Arduino-ESP32 3.x support. A browser installer is available for the 16 MB build.
+> Arduino core 3.x support. A browser installer is available for the 16 MB build.
 
 ```bash
 # 1. Keep your existing src/secrets.h. If it does not exist yet, create it from
@@ -234,9 +231,9 @@ dig @<c6-ip> github.com        # -> real IP  (forwarded)
 
 ## Credits
 
-This project is adapted from [M-Abozaid/esp32-c3-adblock](https://github.com/M-Abozaid/esp32-c3-adblock), an ESP32-C3 DNS ad-blocker. This repository ports and adapts the project for ESP32-C6, with a 16 MB default target and an optional 8 MB build configuration. The hardware requirements, partition layouts, setup steps, and firmware behavior described above apply to this ESP32-C6 adaptation.
+This project adapts M-Abozaid's DNS ad-blocking project for ESP32-C6, with a 16 MB default target and an optional 8 MB build configuration. The hardware requirements, partition layouts, setup steps, and firmware behavior described above apply to ESP32-C6 only.
 
-The upstream project credits [s60sc/ESP32_AdBlocker](https://github.com/s60sc/ESP32_AdBlocker) as inspiration for answering blocked DNS queries with `0.0.0.0`; that attribution is retained here.
+The DNS response approach for answering blocked queries with `0.0.0.0` was inspired by s60sc's AdBlocker project; that attribution is retained here.
 
 ## License
 
