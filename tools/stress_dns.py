@@ -3,15 +3,21 @@
 
 import argparse
 import asyncio
+import getpass
 import ipaddress
 import json
 import math
+import os
 import secrets
 import socket
 import struct
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from collections import Counter
+from http.cookiejar import CookieJar
+from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 
 def make_query(txid, domain):
@@ -76,9 +82,33 @@ def query_case(profile, index):
     return f"load-{index:05d}.doubleclick.net", True
 
 
-def read_stats(host):
+def login_dashboard(host, username, password):
+    opener = build_opener(HTTPCookieProcessor(CookieJar()))
+    request = Request(
+        f"http://{host}/login",
+        data=urllib.parse.urlencode({"username": username, "password": password}).encode(),
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-Requested-With": "c6-adblock",
+        },
+        method="POST",
+    )
     try:
-        with urllib.request.urlopen(f"http://{host}/stats.json", timeout=3) as response:
+        with opener.open(request, timeout=3) as response:
+            if response.status != 200:
+                raise RuntimeError(f"dashboard login returned HTTP {response.status}")
+    except urllib.error.HTTPError as error:
+        if error.code == 401:
+            raise RuntimeError("dashboard username or password is incorrect") from error
+        raise RuntimeError(f"dashboard login returned HTTP {error.code}") from error
+    except OSError as error:
+        raise RuntimeError(f"could not reach dashboard login: {error}") from error
+    return opener
+
+
+def read_stats(opener, host):
+    try:
+        with opener.open(f"http://{host}/stats.json", timeout=3) as response:
             payload = json.load(response)
         fields = (
             "domains", "heap", "blocked", "allowed", "dns_rx_drops",
@@ -211,6 +241,7 @@ async def run_test(args, target_ip):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", required=True, help="ESP32-C6 IP or resolvable hostname")
+    parser.add_argument("--username", default=os.environ.get("C6_WEB_USER"), help="dashboard username (or C6_WEB_USER)")
     parser.add_argument("--profile", choices=("blocked", "forward", "mixed"), default="mixed")
     parser.add_argument("--requests", type=int, default=1000, help="1 to 60000 DNS requests")
     parser.add_argument("--concurrency", type=int, default=64, help="1 to 128 outstanding requests")
@@ -230,9 +261,16 @@ def main():
     except (OSError, ipaddress.AddressValueError) as error:
         parser.error(f"cannot resolve an IPv4 address for {args.host}: {error}")
 
-    before = read_stats(args.host)
+    username = args.username or input("Dashboard username: ")
+    password = os.environ.get("C6_WEB_PASS") or getpass.getpass("Dashboard password: ")
+    try:
+        dashboard = login_dashboard(args.host, username, password)
+    except RuntimeError as error:
+        parser.error(str(error))
+
+    before = read_stats(dashboard, args.host)
     result = asyncio.run(run_test(args, target_ip))
-    after = read_stats(args.host)
+    after = read_stats(dashboard, args.host)
     result["device_stats_before"] = before
     result["device_stats_after"] = after
     if "unavailable" not in before and "unavailable" not in after:

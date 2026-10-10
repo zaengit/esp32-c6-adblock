@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Preprocess hosts/domain blocklists into a sorted truncated-FNV-1a hash blob
-for the ESP32-C6 ad-blocker. Hashes live in flash and are binary-searched on the
-device, so no PSRAM is needed.
+for the ESP32-C6 ad-blocker. Hashes live in flash; the firmware uses a RAM prefix
+directory to read one contiguous hash bucket per typical lookup.
 
 HASH_BYTES MUST match the firmware (src/main.cpp). 5 bytes (40-bit) keeps
 ~0 collisions up to ~500k domains while fitting half a million in <3 MB.
@@ -17,9 +17,11 @@ Usage: build_blocklist.py [out.bin] [src ...]
       https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/ultimate-onlydomains.txt
 """
 import re
-import sys, os, math, urllib.request
+import sys, os, urllib.request
 
 HASH_BYTES = 5                          # 40-bit hashes -- must match firmware
+PREFIX_BITS = 14                        # must match src/main.cpp
+PREFIX_BUCKETS = 1 << PREFIX_BITS
 MASK = (1 << (HASH_BYTES * 8)) - 1
 FNV_OFFSET = 0xcbf29ce484222325
 FNV_PRIME  = 0x100000001b3
@@ -114,7 +116,8 @@ def main():
     print(f'hash entries     : {n:,}  ({HASH_BYTES}-byte / {HASH_BYTES*8}-bit)')
     print(f'collisions       : {collisions}  (domains sharing a hash -> over-block)')
     print(f'flash blob       : {size:,} bytes  ({size/1024/1024:.2f} MB)  -> {out}')
-    print(f'lookup           : ~{math.ceil(math.log2(max(n,2)))} reads/query')
+    print(f'avg prefix bucket: {n / PREFIX_BUCKETS:.1f} hashes')
+    print('lookup           : one contiguous bucket read; dense buckets use binary-search fallback')
 
 if __name__ == '__main__':
     main()
