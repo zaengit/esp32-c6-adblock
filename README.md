@@ -2,7 +2,7 @@
 
 A **Pi-hole-style DNS ad-blocker** for ESP32-C6-WROOM boards — *no PSRAM required*.
 
-> **Origin:** This project adapts M-Abozaid's DNS ad-blocking project for ESP32-C6. See [Credits](#credits) for attribution.
+> **Origin:** Adapted from [M-Abozaid's original ESP32-C3 DNS ad-blocker](https://github.com/M-Abozaid/esp32-c3-adblock) for ESP32-C6. This README covers the ESP32-C6 target only.
 
 The trick everyone misses: you don't need to keep the blocklist in RAM. Store the
 domains as **sorted 40-bit hashes in flash** and binary-search them. 140,000+ domains
@@ -231,7 +231,7 @@ dig @<c6-ip> github.com        # -> real IP  (forwarded)
 
 ## Credits
 
-This project adapts M-Abozaid's DNS ad-blocking project for ESP32-C6, with a 16 MB default target and an optional 8 MB build configuration. The hardware requirements, partition layouts, setup steps, and firmware behavior described above apply to ESP32-C6 only.
+This ESP32-C6 adaptation has a 16 MB default target and an optional 8 MB build configuration. The hardware requirements, partition layouts, setup steps, and firmware behavior described above apply to ESP32-C6 only.
 
 The DNS response approach for answering blocked queries with `0.0.0.0` was inspired by s60sc's AdBlocker project; that attribution is retained here.
 
