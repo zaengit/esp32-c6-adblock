@@ -206,6 +206,40 @@ dig @<c6-ip> doubleclick.net   # -> 0.0.0.0  (blocked)
 dig @<c6-ip> github.com        # -> real IP  (forwarded)
 ```
 
+## DNS stress test
+
+Live stress testing was run on **2026-10-10** against an ESP32-C6 running the
+16 MB configuration with **103,992 blocklist hashes** loaded and about **193 KB
+free heap**. The test client was on the same LAN. `tools/stress_dns.py` sends
+unique UDP A queries and reads `/stats.json` before and after each run. The
+`blocked` profile uses randomized subdomains of `doubleclick.net`; `forward`
+uses randomized subdomains of `example.com`; `mixed` is 80% blocked and 20%
+forwarded. Latency is client-observed round-trip time; forwarding includes the
+upstream DNS response time. No firmware was reflashed, so these results describe
+the image already running on the test device.
+
+| Profile | Requests / concurrency | Replies | Throughput | p50 / p95 latency | Result |
+|---|---:|---:|---:|---:|---|
+| Blocked | 3,000 / 16 | 3,000; 0 timeout | 368.0 replies/s | 38.8 / 105.3 ms | Pass; all returned `0.0.0.0` |
+| Mixed | 1,000 / 32 | 1,000; 0 timeout | 371.1 replies/s | 37.4 / 267.4 ms | Pass; 800 blocked, 200 forwarded |
+| Forward | 500 / 64 | 500; 0 timeout | 140.4 replies/s | 427.9 / 492.7 ms | Pass |
+| Mixed | 1,000 / 64 | 996; 4 timeout | 372.6 replies/s | 103.9 / 349.3 ms | 4 queries timed out |
+| Blocked | 10,000 / 64 | 9,669; 331 timeout | 309.4 replies/s | 149.3 / 191.5 ms | 3.31% timed out; no incorrect block answers |
+
+The tested mixed workload completed without timeouts at concurrency 32. Both
+concurrency-64 mixed load and the 10,000-query blocked load had timeouts. In all
+runs, the device reported zero `dns_rx_drops` and `upstream_rx_drops`; those
+counters do not account for every end-to-end timeout. Free-heap readings before
+and after the runs stayed around 193 KB.
+
+Reproduce a passing mixed run and the higher-load blocked run from a client on
+the same LAN:
+
+```bash
+python3 tools/stress_dns.py --host <c6-ip> --profile mixed --requests 1000 --concurrency 32
+python3 tools/stress_dns.py --host <c6-ip> --profile blocked --requests 10000 --concurrency 64
+```
+
 ## Gotchas (learned the hard way)
 
 - **ModemManager** (default on Fedora/Ubuntu) grabs `/dev/ttyACM0` and toggles
