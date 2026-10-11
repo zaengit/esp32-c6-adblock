@@ -201,8 +201,9 @@ The dashboard at **http://c6adblock.local** does it all:
 
 - **Blocklist** — drop a freshly built `blocklist.bin` into *Blocklist → Upload*, or set a
   direct URL to a compatible prebuilt file under *Remote auto-update*. The device
-  checks that URL on the configured schedule (24 hours by default); no remote source
-  is configured until you provide one. Build compatible files with
+  accepts HTTPS URLs with certificate validation, follows only HTTPS redirects,
+  and checks the source on the configured schedule (24 hours by default); no remote
+  source is configured until you provide one. Build compatible files with
   [`tools/build_blocklist.py`](tools/build_blocklist.py).
 - **Firmware** — upload `.pio/build/<environment>/firmware.bin` under *Firmware → OTA update*;
   use `c6` for ESP32-C6. The dashboard login protects the upload, then the device

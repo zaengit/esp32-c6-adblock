@@ -12,8 +12,10 @@
 #include <Update.h>            // firmware OTA
 #include <HTTPClient.h>        // remote blocklist fetch
 #include <WiFiClientSecure.h>  // https fetch
+#include <freertos/semphr.h>
 #include <DNSServer.h>         // captive-portal catch-all DNS
 #include <Preferences.h>       // NVS store for provisioned WiFi creds
+#include <time.h>
 #include "esp32-hal-rgb-led.h" // addressable RGB LED on the ESP32-C6-DevKitC-1
 #include "esp_netif.h"         // AP DHCP DNS + NAPT routing
 #include "lwip/etharp.h"
@@ -52,6 +54,8 @@ static const int DNS_PENDING_MAX = 32;
 static const int DNS_MAX_QUESTION = 260;
 static const int DNS_RX_QUEUE_SIZE = 128;
 static const int UPSTREAM_RX_QUEUE_SIZE = 32;
+static const size_t DNS_RX_QUEUE_MAX_BYTES = 64 * 1024;
+static const size_t UPSTREAM_RX_QUEUE_MAX_BYTES = 16 * 1024;
 static const uint32_t DNS_CACHE_MAX_AGE_MS = 300000UL;
 static const uint32_t DNS_UPSTREAM_TIMEOUT_MS = 1000UL;
 
@@ -95,6 +99,7 @@ struct DnsCacheEntry {
   uint16_t requestLen = 0;
   uint16_t questionLen = 0;
   uint64_t queryKey = 0;
+  uint32_t storedAt = 0;
   uint32_t expiresAt = 0;
   bool valid = false;
 };
@@ -132,6 +137,18 @@ static uint8_t dnsRxHead = 0, dnsRxTail = 0, dnsRxCount = 0;
 static uint8_t upstreamRxHead = 0, upstreamRxTail = 0, upstreamRxCount = 0;
 static uint32_t dnsRxDrops = 0, upstreamRxDrops = 0;
 static portMUX_TYPE dnsRxMux = portMUX_INITIALIZER_UNLOCKED;
+static size_t dnsRxQueuedBytes = 0, upstreamRxQueuedBytes = 0;
+static SemaphoreHandle_t dnsStateMutex = nullptr;
+
+class DnsStateLock {
+ public:
+  DnsStateLock() : locked(dnsStateMutex && xSemaphoreTake(dnsStateMutex, portMAX_DELAY) == pdTRUE) {}
+  ~DnsStateLock() { if (locked) xSemaphoreGive(dnsStateMutex); }
+  explicit operator bool() const { return locked; }
+  void unlock() { if (locked) { xSemaphoreGive(dnsStateMutex); locked = false; } }
+ private:
+  bool locked;
+};
 
 struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed, lastSeen; bool banned; String label; };
 static const int MAX_CLIENTS = 128;
@@ -368,6 +385,10 @@ static void logBlockedQuery(const char* domain, uint32_t ip, const char* reason)
 
 // ---------- persistence ----------
 static void loadCustom() {
+  if (!LittleFS.exists("/custom.txt") && LittleFS.exists("/custom.old") &&
+      !LittleFS.rename("/custom.old", "/custom.txt")) return;
+  LittleFS.remove("/custom.new");
+  if (LittleFS.exists("/custom.txt")) LittleFS.remove("/custom.old");
   numCustom = 0; File f = LittleFS.open("/custom.txt", "r"); if (!f) return;
   while (f.available() && numCustom < MAX_CUSTOM) {
     String l = f.readStringUntil('\n'); l.trim(); l.toLowerCase();
@@ -375,21 +396,68 @@ static void loadCustom() {
   }
   f.close();
 }
-static void saveCustom() { File f = LittleFS.open("/custom.txt", "w"); if (!f) return; for (int i = 0; i < numCustom; i++) f.println(customDom[i]); f.close(); }
+static bool saveCustom() {
+  File f = LittleFS.open("/custom.new", "w"); if (!f) return false;
+  bool ok = true;
+  for (int i = 0; i < numCustom; i++) {
+    String line = customDom[i]; line += '\n';
+    if (f.print(line) != line.length()) { ok = false; break; }
+  }
+  f.close();
+  if (!ok) { LittleFS.remove("/custom.new"); return false; }
+  const bool hadActive = LittleFS.exists("/custom.txt");
+  LittleFS.remove("/custom.old");
+  if (hadActive && !LittleFS.rename("/custom.txt", "/custom.old")) {
+    LittleFS.remove("/custom.new");
+    return false;
+  }
+  if (!LittleFS.rename("/custom.new", "/custom.txt")) {
+    if (hadActive) LittleFS.rename("/custom.old", "/custom.txt");
+    LittleFS.remove("/custom.new");
+    return false;
+  }
+  LittleFS.remove("/custom.old");
+  return true;
+}
+static bool validCustomDomain(const String& domain) {
+  if (!domain.length() || domain.length() > 253 || domain[0] == '.' || domain[domain.length() - 1] == '.') return false;
+  size_t labelLength = 0;
+  for (size_t i = 0; i < domain.length(); i++) {
+    const char ch = domain[i];
+    if (ch == '.') {
+      if (!labelLength || labelLength > 63) return false;
+      labelLength = 0;
+    } else {
+      if (!((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_')) return false;
+      if (++labelLength > 63) return false;
+    }
+  }
+  return labelLength > 0;
+}
 static bool addCustom(String d) {
   d.trim(); d.toLowerCase(); if (d.startsWith("www.")) d = d.substring(4);
-  if (!d.length() || d.indexOf('.') < 0 || numCustom >= MAX_CUSTOM) return false;
+  if (!validCustomDomain(d) || d.indexOf('.') < 0 || numCustom >= MAX_CUSTOM) return false;
   for (int i = 0; i < numCustom; i++) if (customDom[i] == d) return false;
-  customDom[numCustom] = d; customHash[numCustom] = fnv40(d.c_str(), d.length()); numCustom++; saveCustom();
+  customDom[numCustom] = d; customHash[numCustom] = fnv40(d.c_str(), d.length()); numCustom++;
+  if (!saveCustom()) { numCustom--; return false; }
   invalidateDnsCache();
   return true;
 }
-static void removeCustom(String d) {
+static bool removeCustom(String d) {
   d.toLowerCase();
   for (int i = 0; i < numCustom; i++) if (customDom[i] == d) {
+    String removedDomain = customDom[i];
+    uint64_t removedHash = customHash[i];
     for (int j = i; j < numCustom - 1; j++) { customDom[j] = customDom[j+1]; customHash[j] = customHash[j+1]; }
-    numCustom--; saveCustom(); invalidateDnsCache(); return;
+    numCustom--;
+    if (!saveCustom()) {
+      for (int j = numCustom; j > i; j--) { customDom[j] = customDom[j-1]; customHash[j] = customHash[j-1]; }
+      customDom[i] = removedDomain; customHash[i] = removedHash; numCustom++;
+      return false;
+    }
+    invalidateDnsCache(); return true;
   }
+  return false;
 }
 static bool isBannedIP(uint32_t ip) { for (int i = 0; i < numBanned; i++) if (bannedIP[i] == ip) return true; return false; }
 static void loadBanned() {
@@ -397,12 +465,59 @@ static void loadBanned() {
   while (f.available() && numBanned < MAX_BAN) { String l = f.readStringUntil('\n'); l.trim(); IPAddress ip; if (l.length() && ip.fromString(l)) bannedIP[numBanned++] = (uint32_t)ip; }
   f.close();
 }
-static void saveBanned() {
-  numBanned = 0;
-  for (int i = 0; i < numClients && numBanned < MAX_BAN; i++) if (clients[i].banned) bannedIP[numBanned++] = clients[i].ip;
-  File f = LittleFS.open("/banned.txt", "w"); if (!f) return;
-  for (int i = 0; i < numBanned; i++) { IPAddress ip(bannedIP[i]); f.println(ip.toString()); }
+static const char* BANNED_TEMP_PATH = "/banned.new";
+static const char* BANNED_BACKUP_PATH = "/banned.old";
+static void recoverBannedSwap() {
+  if (!LittleFS.exists("/banned.txt") && LittleFS.exists(BANNED_BACKUP_PATH) &&
+      !LittleFS.rename(BANNED_BACKUP_PATH, "/banned.txt")) return;
+  LittleFS.remove(BANNED_TEMP_PATH);
+  if (LittleFS.exists("/banned.txt")) LittleFS.remove(BANNED_BACKUP_PATH);
+}
+static bool saveBanned() {
+  File f = LittleFS.open(BANNED_TEMP_PATH, "w"); if (!f) return false;
+  bool ok = true;
+  for (int i = 0; i < numBanned; i++) {
+    IPAddress ip(bannedIP[i]);
+    String line = ip.toString(); line += '\n';
+    if (f.print(line) != line.length()) { ok = false; break; }
+  }
   f.close();
+  if (!ok) { LittleFS.remove(BANNED_TEMP_PATH); return false; }
+  const bool hadActive = LittleFS.exists("/banned.txt");
+  LittleFS.remove(BANNED_BACKUP_PATH);
+  if (hadActive && !LittleFS.rename("/banned.txt", BANNED_BACKUP_PATH)) {
+    LittleFS.remove(BANNED_TEMP_PATH);
+    return false;
+  }
+  if (!LittleFS.rename(BANNED_TEMP_PATH, "/banned.txt")) {
+    if (hadActive) LittleFS.rename(BANNED_BACKUP_PATH, "/banned.txt");
+    LittleFS.remove(BANNED_TEMP_PATH);
+    return false;
+  }
+  LittleFS.remove(BANNED_BACKUP_PATH);
+  return true;
+}
+static bool setBannedIP(uint32_t ip, bool banned) {
+  int found = -1;
+  for (int i = 0; i < numBanned; i++) if (bannedIP[i] == ip) { found = i; break; }
+  bool added = false;
+  bool removed = false;
+  if (banned && found < 0) {
+    if (numBanned >= MAX_BAN) return false;
+    bannedIP[numBanned++] = ip;
+    added = true;
+  } else if (!banned && found >= 0) {
+    for (int i = found; i + 1 < numBanned; i++) bannedIP[i] = bannedIP[i + 1];
+    numBanned--;
+    removed = true;
+  }
+  for (int i = 0; i < numClients; i++) if (clients[i].ip == ip) clients[i].banned = banned;
+  if (saveBanned()) return true;
+  if (added) numBanned--;
+  if (removed && numBanned < MAX_BAN) bannedIP[numBanned++] = ip;
+  const bool current = isBannedIP(ip);
+  for (int i = 0; i < numClients; i++) if (clients[i].ip == ip) clients[i].banned = current;
+  return false;
 }
 
 // ---------- client table ----------
@@ -427,8 +542,15 @@ static size_t parseQuery(const uint8_t* pkt, int len, char* out, uint16_t* qtype
   if (len < 17 || (pkt[2] & 0x80) || pkt[4] != 0 || pkt[5] != 1) return 0;
   int i = 12; size_t o = 0;
   while (i < len) { uint8_t l = pkt[i++]; if (l == 0) break; if (l & 0xC0) return 0;
-    if (o + l + 1 >= 250 || i + l > len) return 0; if (o) out[o++] = '.';
-    for (uint8_t k = 0; k < l; k++) out[o++] = tolower(pkt[i++]); }
+    size_t nextLength = o + (o ? 1U : 0U) + l;
+    if (l > 63 || nextLength > 253 || i + l > len) return 0;
+    if (o) out[o++] = '.';
+    for (uint8_t k = 0; k < l; k++) {
+      uint8_t ch = pkt[i++];
+      if (ch < 0x21 || ch > 0x7e || ch == '.') return 0;
+      out[o++] = tolower(ch);
+    }
+  }
   out[o] = 0; if (i + 4 > len) return 0; *qtype = (pkt[i] << 8) | pkt[i + 1]; *qend = i + 4;
   if (o > 4 && strncmp(out, "www.", 4) == 0) { memmove(out, out + 4, o - 3); o -= 4; }
   return o;
@@ -506,6 +628,28 @@ static bool dnsCacheLookup(const uint8_t* query, uint16_t requestLen, uint16_t q
     uint8_t id0 = query[0], id1 = query[1];
     memcpy(buf, e.packet, e.packetLen);
     buf[0] = id0; buf[1] = id1;
+    size_t pos = 12U + questionLen;
+    const uint32_t elapsedSeconds = (now - e.storedAt) / 1000UL;
+    const uint32_t records = ((uint32_t)buf[6] << 8 | buf[7]) +
+                             ((uint32_t)buf[8] << 8 | buf[9]) +
+                             ((uint32_t)buf[10] << 8 | buf[11]);
+    bool validRecords = pos <= e.packetLen;
+    for (uint32_t record = 0; validRecords && record < records; record++) {
+      if (!dnsSkipName(buf, e.packetLen, pos) || pos + 10 > e.packetLen) { validRecords = false; break; }
+      uint16_t type = ((uint16_t)buf[pos] << 8) | buf[pos + 1];
+      uint32_t ttl = ((uint32_t)buf[pos + 4] << 24) | ((uint32_t)buf[pos + 5] << 16) |
+                     ((uint32_t)buf[pos + 6] << 8) | buf[pos + 7];
+      if (type != 41) {
+        ttl = ttl > elapsedSeconds ? ttl - elapsedSeconds : 0;
+        buf[pos + 4] = ttl >> 24; buf[pos + 5] = ttl >> 16;
+        buf[pos + 6] = ttl >> 8; buf[pos + 7] = ttl;
+      }
+      uint16_t rdlen = ((uint16_t)buf[pos + 8] << 8) | buf[pos + 9];
+      pos += 10;
+      if (pos + rdlen > e.packetLen) { validRecords = false; break; }
+      pos += rdlen;
+    }
+    if (!validRecords) { e.valid = false; continue; }
     *replyLen = e.packetLen;
     return true;
   }
@@ -523,17 +667,18 @@ static void dnsCacheStore(const uint8_t* response, uint16_t responseLen, uint16_
   e.requestLen = requestLen;
   e.questionLen = questionLen;
   e.queryKey = queryKey;
+  e.storedAt = millis();
   if (ttl > DNS_CACHE_MAX_AGE_MS / 1000) ttl = DNS_CACHE_MAX_AGE_MS / 1000;
-  e.expiresAt = millis() + ttl * 1000UL;
+  e.expiresAt = e.storedAt + ttl * 1000UL;
   e.valid = true;
 }
 
 template<size_t N>
 static void enqueueDatagram(DnsDatagram (&queue)[N], uint8_t& head,
-                            uint8_t& count, uint32_t& drops,
+                            uint8_t& count, size_t& queuedBytes, size_t maxBytes, uint32_t& drops,
                             AsyncUDPPacket& packet) {
   size_t len = packet.length();
-  if (len == 0 || len > sizeof(buf)) {
+  if (len == 0 || len > sizeof(buf) || len > maxBytes) {
     portENTER_CRITICAL(&dnsRxMux); drops++; portEXIT_CRITICAL(&dnsRxMux);
     return;
   }
@@ -546,7 +691,7 @@ static void enqueueDatagram(DnsDatagram (&queue)[N], uint8_t& head,
   }
   memcpy(data, packet.data(), len);
   portENTER_CRITICAL(&dnsRxMux);
-  if (count >= N) {
+  if (count >= N || queuedBytes + len > maxBytes) {
     drops++;
     portEXIT_CRITICAL(&dnsRxMux);
     free(data);
@@ -557,12 +702,36 @@ static void enqueueDatagram(DnsDatagram (&queue)[N], uint8_t& head,
   d.data = data;
   head = (head + 1) % N;
   count++;
+  queuedBytes += len;
   portEXIT_CRITICAL(&dnsRxMux);
+}
+
+static bool requeueClientDatagram(const IPAddress& ip, uint16_t port, uint16_t len, const uint8_t* data) {
+  uint8_t* copy = (uint8_t*)malloc(len);
+  if (!copy) {
+    portENTER_CRITICAL(&dnsRxMux); dnsRxDrops++; portEXIT_CRITICAL(&dnsRxMux);
+    return false;
+  }
+  memcpy(copy, data, len);
+  portENTER_CRITICAL(&dnsRxMux);
+  if (dnsRxCount >= DNS_RX_QUEUE_SIZE || dnsRxQueuedBytes + len > DNS_RX_QUEUE_MAX_BYTES) {
+    dnsRxDrops++;
+    portEXIT_CRITICAL(&dnsRxMux);
+    free(copy);
+    return false;
+  }
+  DnsDatagram& d = dnsRxQueue[dnsRxHead];
+  d.ip = ip; d.port = port; d.len = len; d.data = copy;
+  dnsRxHead = (dnsRxHead + 1) % DNS_RX_QUEUE_SIZE;
+  dnsRxCount++;
+  dnsRxQueuedBytes += len;
+  portEXIT_CRITICAL(&dnsRxMux);
+  return true;
 }
 
 template<size_t N>
 static bool dequeueDatagram(DnsDatagram (&queue)[N], uint8_t& tail,
-                            uint8_t& count, IPAddress* ip, uint16_t* port,
+                            uint8_t& count, size_t& queuedBytes, IPAddress* ip, uint16_t* port,
                             uint16_t* len, uint8_t* data) {
   bool found = false;
   uint8_t* packetData = nullptr;
@@ -574,6 +743,7 @@ static bool dequeueDatagram(DnsDatagram (&queue)[N], uint8_t& tail,
     d.data = nullptr;
     tail = (tail + 1) % N;
     count--;
+    queuedBytes -= *len;
     found = true;
   }
   portEXIT_CRITICAL(&dnsRxMux);
@@ -582,11 +752,13 @@ static bool dequeueDatagram(DnsDatagram (&queue)[N], uint8_t& tail,
 }
 
 static void onClientDnsPacket(AsyncUDPPacket& packet) {
-  enqueueDatagram(dnsRxQueue, dnsRxHead, dnsRxCount, dnsRxDrops, packet);
+  enqueueDatagram(dnsRxQueue, dnsRxHead, dnsRxCount, dnsRxQueuedBytes,
+                  DNS_RX_QUEUE_MAX_BYTES, dnsRxDrops, packet);
 }
 
 static void onUpstreamPacket(AsyncUDPPacket& packet) {
-  enqueueDatagram(upstreamRxQueue, upstreamRxHead, upstreamRxCount, upstreamRxDrops, packet);
+  enqueueDatagram(upstreamRxQueue, upstreamRxHead, upstreamRxCount, upstreamRxQueuedBytes,
+                  UPSTREAM_RX_QUEUE_MAX_BYTES, upstreamRxDrops, packet);
 }
 
 static void sendDnsReply(const IPAddress& ip, uint16_t port, int len) {
@@ -666,7 +838,7 @@ static bool pollUpstream() {
   bool did = false;
   for (int budget = 0; budget < 32; budget++) {
     IPAddress sourceIP; uint16_t sourcePort = 0; uint16_t n = 0;
-    if (!dequeueDatagram(upstreamRxQueue, upstreamRxTail, upstreamRxCount,
+    if (!dequeueDatagram(upstreamRxQueue, upstreamRxTail, upstreamRxCount, upstreamRxQueuedBytes,
                          &sourceIP, &sourcePort, &n, buf)) break;
     if (sourceIP != UPSTREAM || sourcePort != UPSTREAM_PORT || n < 12 ||
         (buf[2] & 0x80) == 0) continue;
@@ -696,17 +868,17 @@ static bool pollUpstream() {
   return did;
 }
 
-// Process a bounded burst without waiting for upstream replies; pollUpstream() handles
-// completions and timeouts from loop(), so web, OTA, and other DNS clients keep running.
+// Process a bounded burst without waiting for upstream replies. This runs in the
+// DNS worker, separate from synchronous dashboard, upload, and update handlers.
 static bool handleDns() {
   bool did = false;
-  for (int budget = 0; budget < 16; budget++) {
-    // Keep unprocessed client packets queued while all upstream slots are busy.
-    // This avoids returning SERVFAIL just because a short burst filled the
-    // asynchronous request table; pollUpstream() frees slots on the next loop.
-    if (!hasPendingSlot()) break;
+  uint8_t queuedAtStart;
+  portENTER_CRITICAL(&dnsRxMux); queuedAtStart = dnsRxCount; portEXIT_CRITICAL(&dnsRxMux);
+  int scanBudget = queuedAtStart < 16 ? queuedAtStart : 16;
+  for (int budget = 0; budget < scanBudget; budget++) {
     IPAddress cip; uint16_t cport = 0; uint16_t qlen = 0;
-    if (!dequeueDatagram(dnsRxQueue, dnsRxTail, dnsRxCount, &cip, &cport, &qlen, buf)) break;
+    if (!dequeueDatagram(dnsRxQueue, dnsRxTail, dnsRxCount, dnsRxQueuedBytes,
+                         &cip, &cport, &qlen, buf)) break;
     did = true;
     if (qlen < 12) continue;
 
@@ -715,9 +887,9 @@ static bool handleDns() {
     if (qend < 17 || qend > qlen) { sendDnsReply(cip, cport, buildServFail(0)); continue; }
 
     Dev* c = getClient((uint32_t)cip);
-    bool ban = c && c->banned;
+    bool ban = isBannedIP((uint32_t)cip);
     const char* blockReason = ban ? "client" : nullptr;
-    bool blocked = ban || (blockingOn && dl && numHashes && isBlocked(domain, &blockReason));
+    bool blocked = ban || (blockingOn && dl && isBlocked(domain, &blockReason));
     if (blocked) {
       int rlen = buildBlocked(qend, qtype);
       totalBlocked++; if (c) c->blocked++;
@@ -734,11 +906,34 @@ static bool handleDns() {
       sendDnsReply(cip, cport, rlen);
     } else {
       bool queued = queueUpstream(qlen, qend, cip, cport, queryKey);
+      if (!queued && !hasPendingSlot()) {
+        if (requeueClientDatagram(cip, cport, qlen, buf)) continue;
+        continue;
+      }
       totalAllowed++; if (c) c->allowed++;
       if (!queued) sendDnsReply(cip, cport, buildServFail(qend));
     }
   }
   return did;
+}
+
+static void dnsProcessingTask(void*) {
+  while (true) {
+    bool busy = false;
+    {
+      DnsStateLock state;
+      if (state) {
+        busy = pollUpstream();
+        busy = handleDns() || busy;
+        if (!blockingOn && resumeAt && (int32_t)(millis() - resumeAt) >= 0) {
+          blockingOn = true;
+          resumeAt = 0;
+        }
+      }
+    }
+    if (!busy) vTaskDelay(pdMS_TO_TICKS(1));
+    else taskYIELD();
+  }
 }
 
 // ---------- web ----------
@@ -908,6 +1103,8 @@ static void handleDashboardRoot() {
 
 static void handleStats() {
   if (!requireSession()) return;
+  DnsStateLock state;
+  if (!state) { web.send(503, "text/plain", "DNS state unavailable"); return; }
   uint32_t up = millis() / 1000;
   uint32_t clientDrops, upstreamDrops;
   portENTER_CRITICAL(&dnsRxMux);
@@ -936,6 +1133,7 @@ static void handleStats() {
   j += "],\"custom\":[";
   for (int i = 0; i < numCustom; i++) { j += (i ? "," : ""); j += "\"" + jesc(customDom[i]) + "\""; }
   j += "]}";
+  state.unlock();
   web.sendHeader("Cache-Control", "no-store");
   web.send(200, "application/json", j);
 }
@@ -944,6 +1142,8 @@ static void handleStats() {
 // An open SSE response would hold that loop while the browser stays connected.
 static void handleBlockedEvents() {
   if (!requireSession()) return;
+  DnsStateLock state;
+  if (!state) { web.send(503, "text/plain", "DNS state unavailable"); return; }
   uint32_t after = web.hasArg("after") ? (uint32_t)strtoul(web.arg("after").c_str(), nullptr, 10) : 0;
   uint32_t clientBoot = web.hasArg("boot") ? (uint32_t)strtoul(web.arg("boot").c_str(), nullptr, 10) : 0;
   uint32_t latest = blockLogSeq;
@@ -977,6 +1177,7 @@ static void handleBlockedEvents() {
     json += ",\"reason\":\""; json += reason; json += "\"}";
   }
   json += "]}";
+  state.unlock();
   web.sendHeader("Cache-Control", "no-store");
   web.send(200, "application/json", json);
 }
@@ -999,7 +1200,8 @@ static bool clearAllConfiguration() {
   for (const char* name : namespaces) {
     if (!clearPreferencesNamespace(name)) return false;
   }
-  const char* files[] = {"/custom.txt", "/banned.txt", "/update.cfg", "/blocklist.new"};
+  const char* files[] = {"/custom.txt", "/custom.new", "/custom.old", "/banned.txt", "/banned.new", "/banned.old",
+                         "/update.cfg", "/blocklist.new"};
   for (const char* path : files) {
     if (!removeConfigFile(path)) return false;
   }
@@ -1124,7 +1326,15 @@ static void handleWifiUpdate() {
 }
 static void handleBan() {
   if (!requireAuth()) return;
-  IPAddress ip; if (ip.fromString(web.arg("ip"))) { Dev* c = getClient((uint32_t)ip); if (c) { c->banned = !c->banned; saveBanned(); } }
+  IPAddress ip;
+  if (!ip.fromString(web.arg("ip"))) { web.send(400, "text/plain", "invalid client IP"); return; }
+  DnsStateLock state;
+  if (!state) { web.send(503, "text/plain", "DNS state unavailable"); return; }
+  const uint32_t value = (uint32_t)ip;
+  const bool wasBanned = isBannedIP(value);
+  if (!wasBanned && numBanned >= MAX_BAN) { web.send(507, "text/plain", "ban list is full"); return; }
+  if (!setBannedIP(value, !wasBanned)) { web.send(500, "text/plain", "could not save ban list"); return; }
+  state.unlock();
   web.send(200, "text/plain", "ok");
 }
 
@@ -1158,16 +1368,20 @@ static void beginBlocklistSwap() {
 static bool validateBlocklistFile(File& f, size_t& sizeOut) {
   sizeOut = f ? f.size() : 0;
   if (!f || !sizeOut || (sizeOut % HASH_BYTES) != 0 || (sizeOut / HASH_BYTES) > MAX_INDEXED_HASHES || !f.seek(0)) return false;
-  uint8_t item[HASH_BYTES];
+  uint8_t chunk[1020];  // 204 hashes per read; retain the previous value across chunks.
+  size_t remaining = sizeOut;
   uint64_t previous = 0;
   bool havePrevious = false;
-  const uint32_t count = sizeOut / HASH_BYTES;
-  for (uint32_t i = 0; i < count; i++) {
-    if (f.read(item, HASH_BYTES) != HASH_BYTES) return false;
-    const uint64_t value = unpackHash(item);
-    if (havePrevious && value <= previous) return false;
-    previous = value;
-    havePrevious = true;
+  while (remaining) {
+    size_t bytes = remaining < sizeof(chunk) ? remaining : sizeof(chunk);
+    if (bytes % HASH_BYTES || f.read(chunk, bytes) != bytes) return false;
+    for (size_t pos = 0; pos < bytes; pos += HASH_BYTES) {
+      const uint64_t value = unpackHash(chunk + pos);
+      if (havePrevious && value <= previous) return false;
+      previous = value;
+      havePrevious = true;
+    }
+    remaining -= bytes;
   }
   return true;
 }
@@ -1194,6 +1408,9 @@ static bool commitNewBlocklist() {
   const bool valid = validateBlocklistFile(staged, stagedSize);
   if (staged) staged.close();
   if (!valid) { LittleFS.remove(BLOCKLIST_TEMP_PATH); return false; }
+
+  DnsStateLock state;
+  if (!state) { LittleFS.remove(BLOCKLIST_TEMP_PATH); return false; }
 
   const bool hadActive = LittleFS.exists(BLOCKLIST_PATH);
   if (blocklist) blocklist.close();
@@ -1228,6 +1445,8 @@ static bool commitNewBlocklist() {
 // ---------- OTA blocklist update (browser upload) ----------
 static bool upOk = false;
 static bool upAuthOk = false;
+static bool upWriteOk = false;
+static size_t upBytes = 0;
 static File upFile;
 static void handleUploadDone() {
   if (!upAuthOk) { web.send(401, "text/plain", "login required"); return; }
@@ -1240,56 +1459,138 @@ static void handleUpload() {
     case UPLOAD_FILE_START:
       upAuthOk = requestHasControlSession();
       if (!upAuthOk) { Serial.println("[ota] blocklist upload: auth/CSRF check failed"); break; }
-      upOk = false; beginBlocklistSwap();
+      upOk = false; upWriteOk = true; upBytes = 0; beginBlocklistSwap();
       upFile = LittleFS.open(BLOCKLIST_TEMP_PATH, "w");
+      if (!upFile) upWriteOk = false;
       Serial.printf("[ota] receiving %s\n", u.filename.c_str());
       break;
     case UPLOAD_FILE_WRITE:
-      if (upAuthOk && upFile) upFile.write(u.buf, u.currentSize);
+      if (upAuthOk && upFile && upWriteOk) {
+        size_t written = upFile.write(u.buf, u.currentSize);
+        upBytes += written;
+        if (written != u.currentSize) upWriteOk = false;
+      }
       break;
     case UPLOAD_FILE_END:
       if (!upAuthOk) break;
       if (upFile) upFile.close();
-      upOk = commitNewBlocklist();
+      upOk = upWriteOk && upBytes == u.totalSize && commitNewBlocklist();
+      if (!upOk) LittleFS.remove(BLOCKLIST_TEMP_PATH);
       Serial.printf("[ota] %s -> %u domains\n", upOk ? "OK" : "REJECTED", numHashes);
       break;
     case UPLOAD_FILE_ABORTED:
       if (!upAuthOk) break;
       if (upFile) upFile.close();
       LittleFS.remove(BLOCKLIST_TEMP_PATH);
+      upWriteOk = false;
       Serial.println("[ota] aborted");
       break;
   }
 }
 
 // ---------- remote blocklist auto-update ----------
+static const uint32_t MAX_UPDATE_INTERVAL_H = 1193;
+static bool validBlocklistUrl(const String& url) {
+  return !url.length() || (url.length() <= 512 && url.startsWith("https://") && !hasControlCharacter(url));
+}
+static bool parseUpdateInterval(const String& value, uint32_t* hoursOut) {
+  if (!value.length()) return false;
+  char* end = nullptr;
+  long hours = strtol(value.c_str(), &end, 10);
+  if (end == value.c_str() || *end != '\0' || hours < 1 || hours > (long)MAX_UPDATE_INTERVAL_H) return false;
+  *hoursOut = (uint32_t)hours;
+  return true;
+}
+static int secureBlocklistGet(HTTPClient& http, WiFiClientSecure& client, const String& initialUrl) {
+  String url = initialUrl;
+  for (uint8_t redirect = 0; redirect <= 5; redirect++) {
+    if (!validBlocklistUrl(url)) return -1;
+    if (!http.begin(client, url)) { http.end(); return -1; }
+    int code = http.GET();
+    if (code == HTTP_CODE_OK) return code;
+    const bool isRedirect = code == 301 || code == 302 || code == 303 || code == 307 || code == 308;
+    String nextUrl = isRedirect ? http.getLocation() : String("");
+    http.end();
+    if (!isRedirect || !nextUrl.length() || redirect == 5 || !validBlocklistUrl(nextUrl)) return code;
+    url = nextUrl;
+  }
+  return -1;
+}
+
+class BoundedFileStream : public Stream {
+ public:
+  BoundedFileStream(File& file, size_t limit, uint32_t timeoutMs)
+      : file_(file), limit_(limit), startedAt_(millis()), timeoutMs_(timeoutMs) {}
+  int available() override { return file_.available(); }
+  int read() override { return file_.read(); }
+  int peek() override { return file_.peek(); }
+  void flush() override { file_.flush(); }
+  size_t write(uint8_t value) override { return write(&value, 1); }
+  size_t write(const uint8_t* data, size_t size) override {
+    if (written_ + size > limit_ || millis() - startedAt_ > timeoutMs_) {
+      failed_ = true;
+      return 0;
+    }
+    size_t written = file_.write(data, size);
+    written_ += written;
+    if (written != size) failed_ = true;
+    return written;
+  }
+  size_t written() const { return written_; }
+  bool failed() const { return failed_; }
+ private:
+  File& file_;
+  size_t limit_;
+  uint32_t startedAt_;
+  uint32_t timeoutMs_;
+  size_t written_ = 0;
+  bool failed_ = false;
+};
+
 static void loadUpdateCfg() {
   File f = LittleFS.open("/update.cfg", "r"); if (!f) return;
-  updateUrl = f.readStringUntil('\n'); updateUrl.trim();
-  String iv = f.readStringUntil('\n'); iv.trim(); if (iv.length()) updateIntervalH = iv.toInt();
-  f.close(); if (updateIntervalH < 1) updateIntervalH = 1;
+  String savedUrl = f.readStringUntil('\n'); savedUrl.trim();
+  String iv = f.readStringUntil('\n'); iv.trim();
+  f.close();
+  updateUrl = validBlocklistUrl(savedUrl) ? savedUrl : String("");
+  long savedHours = iv.toInt();
+  updateIntervalH = savedHours < 1 ? 1 : savedHours > (long)MAX_UPDATE_INTERVAL_H
+      ? MAX_UPDATE_INTERVAL_H : (uint32_t)savedHours;
 }
 static void saveUpdateCfg() {
   File f = LittleFS.open("/update.cfg", "w"); if (!f) return;
   f.println(updateUrl); f.println(updateIntervalH); f.close();
 }
+static bool syncSystemClock() {
+  if (time(nullptr) >= 1704067200) return true;  // 2024-01-01 UTC
+  configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
+  const uint32_t startedAt = millis();
+  while (millis() - startedAt < 10000UL) {
+    if (time(nullptr) >= 1704067200) return true;
+    delay(100);
+  }
+  return false;
+}
 static bool fetchBlocklist(String url) {
   url.trim(); if (!url.length()) { updateStatus = "no url set"; return false; }
+  if (!validBlocklistUrl(url)) { updateStatus = "HTTPS URL required; old list kept"; return false; }
   statusLedFetchNoInternet = WiFi.status() != WL_CONNECTED;
   statusLedFetchingHosts = true;
+  if (WiFi.status() != WL_CONNECTED || !syncSystemClock()) {
+    updateStatus = "clock or network unavailable; old list kept";
+    finishHostFetch(statusLedFetchNoInternet ? StatusLedState::NoInternet : StatusLedState::Failure);
+    return false;
+  }
   beginBlocklistSwap();
   Serial.printf("[remote] GET %s\n", url.c_str());
-  WiFiClientSecure cs; cs.setInsecure();            // blocklist isn't secret -> skip cert pinning
-  WiFiClient cl;
-  HTTPClient http; http.setTimeout(20000);
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);  // GitHub release -> CDN redirect
-  bool https = url.startsWith("https");
-  if (!(https ? http.begin(cs, url) : http.begin(cl, url))) {
+  WiFiClientSecure cs; cs.useBuiltinCACertBundle();
+  HTTPClient http; http.setTimeout(5000);
+  const int code = secureBlocklistGet(http, cs, url);
+  if (code < 0) {
     updateStatus = "begin failed; old list kept";
     finishHostFetch(statusLedFetchNoInternet ? StatusLedState::NoInternet : StatusLedState::Failure);
     return false;
   }
-  int code = http.GET();
   if (code != HTTP_CODE_OK) {
     const bool noInternet = code < 0 || WiFi.status() != WL_CONNECTED;
     http.end(); updateStatus = "HTTP " + String(code) + "; old list kept";
@@ -1298,26 +1599,29 @@ static bool fetchBlocklist(String url) {
     return false;
   }
   statusLedFetchNoInternet = false;
+  const size_t freeBytes = LittleFS.totalBytes() - LittleFS.usedBytes();
+  const size_t availableBytes = freeBytes > 4096 ? freeBytes - 4096 : 0;
+  const size_t maxListBytes = (size_t)MAX_INDEXED_HASHES * HASH_BYTES;
+  const size_t maxDownload = availableBytes < maxListBytes ? availableBytes : maxListBytes;
+  if (!maxDownload) {
+    http.end(); updateStatus = "not enough free storage; old list kept";
+    finishHostFetch(StatusLedState::Failure);
+    return false;
+  }
   File f = LittleFS.open(BLOCKLIST_TEMP_PATH, "w");
   if (!f) {
     http.end(); updateStatus = "storage open failed; old list kept";
     finishHostFetch(StatusLedState::Failure);
     return false;
   }
-  WiFiClient* stream = http.getStreamPtr();
-  int len = http.getSize(); uint8_t b[1024]; size_t total = 0; uint32_t idle = millis(); bool writeOk = true;
-  while (http.connected() && (len < 0 || (int)total < len)) {
-    size_t avail = stream->available();
-    if (avail) {
-      int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail);
-      if (n > 0) {
-        if (f.write(b, n) != (size_t)n) { writeOk = false; break; }
-        total += n; idle = millis();
-      }
-    } else { if (millis() - idle > 15000) { writeOk = false; break; } delay(2); }
-  }
+  const int contentLength = http.getSize();
+  BoundedFileStream sink(f, maxDownload, 120000UL);
+  const int copied = http.writeToStream(&sink);
+  const size_t total = sink.written();
+  const bool writeOk = copied >= 0 && !sink.failed() &&
+                       (contentLength < 0 || total == (size_t)contentLength);
   f.close(); http.end();
-  if (!writeOk || (len >= 0 && total != (size_t)len)) {
+  if (!writeOk) {
     LittleFS.remove(BLOCKLIST_TEMP_PATH);
     updateStatus = "download incomplete (" + String(total) + "B); old list kept";
     Serial.printf("[remote] %s\n", updateStatus.c_str());
@@ -1590,6 +1894,7 @@ void setup() {
     statusLedCriticalFailure = true;
   }
   recoverBlocklistSwap();
+  recoverBannedSwap();
   const bool blocklistOk = reopenBlocklist();
   settleBlocklistBackup(blocklistOk);
   Serial.printf("blocklist: %u domains\n", numHashes);
@@ -1623,9 +1928,13 @@ void setup() {
   upstreamCli.onPacket(onUpstreamPacket);
   bool dnsReady = dnsServer.listen(DNS_PORT);
   bool upstreamReady = upstreamCli.listen(0);
+  dnsStateMutex = xSemaphoreCreateMutex();
   Serial.printf("AsyncUDP DNS :53 %s, upstream socket %s\n",
                 dnsReady ? "ready" : "FAILED", upstreamReady ? "ready" : "FAILED");
-  if (!dnsReady || !upstreamReady) statusLedCriticalFailure = true;
+  if (!dnsReady || !upstreamReady || !dnsStateMutex) statusLedCriticalFailure = true;
+  if (dnsReady && upstreamReady && dnsStateMutex &&
+      xTaskCreate(dnsProcessingTask, "dns-worker", 8192, nullptr, tskIDLE_PRIORITY + 1, nullptr) != pdPASS)
+    statusLedCriticalFailure = true;
   if (dnsReady && upstreamReady) {
     if (dnsApEnabled) startDnsAccessPoint();
     else Serial.println("[router] DNS access point disabled in dashboard settings");
@@ -1641,30 +1950,66 @@ void setup() {
   web.on("/wifi", HTTP_POST, handleWifiUpdate);
   web.on("/events.json", handleBlockedEvents);
   web.on("/ban", handleBan);
-  web.on("/addblock", []() { if (!requireAuth()) return; addCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
-  web.on("/unblock", []() { if (!requireAuth()) return; removeCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
+  web.on("/addblock", []() {
+    if (!requireAuth()) return;
+    DnsStateLock state;
+    if (!state) { web.send(503, "text/plain", "DNS state unavailable"); return; }
+    bool added = addCustom(web.arg("d"));
+    state.unlock();
+    web.send(added ? 200 : 400, "text/plain", added ? "ok" : "invalid, duplicate, or full custom list");
+  });
+  web.on("/unblock", []() {
+    if (!requireAuth()) return;
+    DnsStateLock state;
+    if (!state) { web.send(503, "text/plain", "DNS state unavailable"); return; }
+    bool removed = removeCustom(web.arg("d"));
+    state.unlock();
+    web.send(removed ? 200 : 404, "text/plain", removed ? "ok" : "custom domain not found");
+  });
   web.on("/pause", []() {                    // /pause?s=300  (0 or absent = indefinite)
     if (!requireAuth()) return;
     long s = web.hasArg("s") ? web.arg("s").toInt() : 0;
+    DnsStateLock state;
+    if (!state) { web.send(503, "text/plain", "DNS state unavailable"); return; }
     blockingOn = false; resumeAt = (s > 0) ? millis() + (uint32_t)s * 1000UL : 0;
+    state.unlock();
     web.send(200, "text/plain", "paused");
   });
-  web.on("/resume", []() { if (!requireAuth()) return; blockingOn = true; resumeAt = 0; web.send(200, "text/plain", "resumed"); });
+  web.on("/resume", []() {
+    if (!requireAuth()) return;
+    DnsStateLock state;
+    if (!state) { web.send(503, "text/plain", "DNS state unavailable"); return; }
+    blockingOn = true; resumeAt = 0;
+    state.unlock();
+    web.send(200, "text/plain", "resumed");
+  });
   web.on("/upload", HTTP_POST, handleUploadDone, handleUpload);      // blocklist OTA (auth inside handleUpload)
   web.on("/update", HTTP_POST, handleFwUpdateDone, handleFwUpload);  // firmware OTA (auth inside handleFwUpload)
   web.on("/fetchnow", []() {
     if (!requireAuth()) return;
+    String nextUrl = updateUrl;
+    uint32_t nextInterval = updateIntervalH;
     if (web.hasArg("u")) {
-      updateUrl = web.arg("u"); updateUrl.trim();
-      if (web.hasArg("h")) { updateIntervalH = web.arg("h").toInt(); if (updateIntervalH < 1) updateIntervalH = 1; }
-      saveUpdateCfg();
+      nextUrl = web.arg("u"); nextUrl.trim();
+      if (!validBlocklistUrl(nextUrl)) { web.send(400, "text/plain", "an HTTPS blocklist URL is required"); return; }
     }
+    if (web.hasArg("h") && !parseUpdateInterval(web.arg("h"), &nextInterval)) {
+      web.send(400, "text/plain", "update interval must be 1-1193 hours"); return;
+    }
+    updateUrl = nextUrl; updateIntervalH = nextInterval;
+    saveUpdateCfg();
     fetchBlocklist(updateUrl); web.send(200, "text/plain", updateStatus);
   });
   web.on("/setupdate", []() {
     if (!requireAuth()) return;
-    if (web.hasArg("u")) updateUrl = web.arg("u");
-    if (web.hasArg("h")) { updateIntervalH = web.arg("h").toInt(); if (updateIntervalH < 1) updateIntervalH = 1; }
+    String nextUrl = updateUrl;
+    uint32_t nextInterval = updateIntervalH;
+    if (web.hasArg("u")) { nextUrl = web.arg("u"); nextUrl.trim(); }
+    if (!validBlocklistUrl(nextUrl)) { web.send(400, "text/plain", "an HTTPS blocklist URL is required"); return; }
+    if (web.hasArg("h") && !parseUpdateInterval(web.arg("h"), &nextInterval)) {
+      web.send(400, "text/plain", "update interval must be 1-1193 hours"); return;
+    }
+    updateUrl = nextUrl; updateIntervalH = nextInterval;
     saveUpdateCfg(); updateStatus = updateUrl.length() ? "configured" : "no url set"; web.send(200, "text/plain", "ok");
   });
   web.begin();
@@ -1673,13 +2018,10 @@ void setup() {
 
 void loop() {
   web.handleClient();
-  bool busy = pollUpstream();
-  busy = handleDns() || busy;
-  if (!blockingOn && resumeAt && (int32_t)(millis() - resumeAt) >= 0) { blockingOn = true; resumeAt = 0; }
   if (updateUrl.length()) {               // periodic remote blocklist auto-update
     uint32_t now = millis();
     if (lastCheckMs == 0) lastCheckMs = now;   // skip an immediate fetch on boot
     else if (now - lastCheckMs >= updateIntervalH * 3600000UL) { lastCheckMs = now; fetchBlocklist(updateUrl); }
   }
-  if (!busy) delay(1);   // sleep only when idle: full speed under load, cool when quiet
+  delay(1);
 }
