@@ -2,6 +2,8 @@
 
 A **Pi-hole-style DNS ad-blocker** for ESP32-C6-WROOM boards — *no PSRAM required*.
 
+![ESP32-C6 AdBlock dashboard](dashbord.png)
+
 > **Origin:** Adapted for ESP32-C6 from [M-Abozaid's DNS ad-blocker for ESP32-C3](https://github.com/M-Abozaid/esp32-c3-adblock). This README covers the ESP32-C6 adaptation only.
 
 The trick everyone misses: you don't need to keep the blocklist in RAM. Store the
